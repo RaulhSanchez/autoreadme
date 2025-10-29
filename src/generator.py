@@ -1,239 +1,221 @@
-import textwrap
-from ollama import chat
-import json
+# generator.py
 import os
+import json
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from jinja2 import Environment, FileSystemLoader
+from ollama import chat
+from analyzer import analyze_project_with_qwen
+import hashlib
 
-def generate_elaborated_intro(project_data):
-    """
-    Genera un resumen del proyecto y arquitectura más profundo usando Mistral.
-    """
-    name = project_data.get("name", "Proyecto sin nombre")
-    desc = project_data.get("description", "Sin descripción")
+MAX_LINES = 200
+CACHE_DIR = "/tmp/analyze_cache"
+SQL_CACHE_DIR = os.path.join(CACHE_DIR, "sql_cache")
+os.makedirs(SQL_CACHE_DIR, exist_ok=True)
+MAX_WORKERS = 3  # Paralelismo para SQL/JS/TS
 
-    # Carpetas y archivos resumidos
-    folders_summary = project_data.get("folders_summary", {})
-    folder_info = []
-    for folder, files in folders_summary.items():
-        for f in files[:10]:  # más info para Mistral
-            folder_info.append(
-                f"{f.get('path')} → {f.get('narrative','')} "
-                f"Funciones: {[fn['name'] for fn in f.get('functions', [])][:5]} "
-                f"Exports: {f.get('exports', [])[:5]}"
-            )
-    folder_info_text = "\n".join(folder_info[:20])  # top 20
+# -------------------------------
+# 🔍 Funciones de cache y hash
+# -------------------------------
+def file_hash(path):
+    """Devuelve el hash MD5 de un archivo"""
+    with open(path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
 
-    # Rutas y handlers
-    routes_info = []
-    for folder_files in folders_summary.values():
-        for f in folder_files:
-            if os.path.basename(f.get("path", "")) == "router.js":
-                for r in f.get("routes", []):
-                    routes_info.append(f"{r['method']} {r['path']} → handler {r['handler']}")
-    routes_text = "\n".join(routes_info[:20])
+def read_cache(cache_file):
+    if os.path.exists(cache_file):
+        try:
+            return json.load(open(cache_file, encoding="utf-8"))
+        except Exception:
+            return None
+    return None
 
-    # DB clients y SQL
-    db_clients = []
-    sql_info = []
-    for folder_files in folders_summary.values():
-        for f in folder_files:
-            db_clients += f.get("db_clients", [])
-            sql_info += [q[:100] + "..." for q in f.get("sql_queries", [])]
-    db_clients = list(dict.fromkeys(db_clients))[:10]
-    sql_info = sql_info[:20]
+def write_cache(cache_file, data):
+    with open(cache_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-    prompt = textwrap.dedent(f"""
-    Eres un asistente técnico experto en documentación de software Node.js.
-    Tienes información completa sobre un proyecto llamado '{name}'.
+# -------------------------------
+# 🔍 Analiza cada archivo SQL/JS/TS en src/data
+# -------------------------------
+def analyze_db_file(path):
+    cache_file = os.path.join(SQL_CACHE_DIR, os.path.basename(path) + ".json")
+    cached = read_cache(cache_file)
+    h = file_hash(path)
+    if cached and cached.get("hash") == h:
+        return cached["analysis"]
 
-    Breve descripción: {desc}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
 
-    Carpetas y archivos:
-    {folder_info_text}
+        lines = content.splitlines()
+        content_short = "\n".join(lines[:MAX_LINES]) if len(lines) > MAX_LINES else content
 
-    Rutas y handlers:
-    {routes_text}
+        prompt = f"""
+Analiza este archivo del proyecto: {path}
 
-    Clientes de DB usados: {', '.join(db_clients) or 'Ninguno'}
-    Consultas SQL detectadas: {', '.join(sql_info) or 'Ninguna'}
+1. Explica en castellano qué consultas SQL, conexiones a base de datos o servicios externos realiza.
+2. Indica las tablas o endpoints afectados y el propósito técnico de cada operación.
+3. Menciona desde qué funciones o métodos se invocan las consultas.
+4. Resume cualquier lógica adicional relevante para la base de datos.
 
-    Redacta de manera profesional y detallada:
+Archivo completo:
+{content_short}
+"""
+        response = chat(model="qwen2.5-coder:14b", messages=[{"role": "user", "content": prompt}])
+        analysis = f"### Archivo: {os.path.basename(path)}\n{response['message']['content']}"
 
-    1. **Resumen del proyecto**: Explica el propósito principal, problemas que resuelve, cómo interactúan módulos y capas, y el impacto real para usuarios y desarrolladores.
-    2. **Arquitectura y flujo de datos**: Explica las capas, responsabilidades, flujo de datos desde la petición hasta la base de datos y respuesta, y cómo interactúan las dependencias críticas.
-    """)
-    
-    response = chat(
-        model="mistral:latest",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    
-    return response['message']['content']
+        write_cache(cache_file, {"hash": h, "analysis": analysis})
+        return analysis
+    except Exception as e:
+        return f"### Archivo: {os.path.basename(path)}\nNo se pudo analizar: {str(e)}"
 
+def analyze_db_queries(project_path):
+    data_folder = os.path.join(project_path, "src", "data")
+    if not os.path.exists(data_folder):
+        return "No se encontró la carpeta src/data."
 
-def generate_readme_explained(project_data, output_path):
-    """
-    Genera un README.md usando la información real de project_data,
-    con secciones elaboradas de Resumen y Arquitectura.
-    """
+    sql_files = [
+        os.path.join(root, f)
+        for root, _, files in os.walk(data_folder)
+        for f in files if f.endswith((".js", ".ts", ".sql"))
+    ]
+    if not sql_files:
+        return "No se encontraron archivos .js, .ts o .sql en src/data."
 
-    # --- HEADER y metadatos ---
-    name = project_data.get("name", "Proyecto sin nombre")
-    desc = project_data.get("description", "Sin descripción")
-    deps = ", ".join(project_data.get("dependencies", [])) or "Ninguna"
-    devdeps = ", ".join(project_data.get("devDependencies", [])) or "Ninguna"
-    scripts = project_data.get("scripts", {})
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(analyze_db_file, f) for f in sql_files]
+        for future in as_completed(futures):
+            results.append(future.result())
 
-    # --- Estructura ---
-    structure = project_data.get("structure", "")
+    return "\n\n".join(results)
 
-    # --- Detalle por carpeta ---
-    folders = project_data.get("folders_summary", {})
-    folder_sections = []
-    for folder, files in folders.items():
-        folder_text = f"## Carpeta: `{folder}`\n\nDescripción general:\n"
-        narratives = []
+# -------------------------------
+# 🔍 Funciones de RAG y rutas
+# -------------------------------
+def extract_routes_from_code(code, filename):
+    routes = []
+    pattern = re.compile(r"(?:app|router)\.(get|post|put|delete|patch)\s*\(\s*['\"]([^'\"]+)['\"]\s*,\s*([^)]+)\)")
+    comment_pattern = re.compile(r"//(.*)$|/\*\*(.*?)\*/", re.MULTILINE | re.DOTALL)
+    comments = [m.group(1) or m.group(2) for m in comment_pattern.finditer(code)]
+    matches = pattern.findall(code)
+
+    for i, match in enumerate(matches):
+        method, path, handler = match
+        handler_list = [h.strip() for h in handler.split(",") if h.strip()]
+        comment = comments[i] if i < len(comments) else ""
+        routes.append({
+            "file": filename,
+            "method": method.upper(),
+            "path": path,
+            "handlers": handler_list,
+            "comment": comment.strip(),
+        })
+    return routes
+
+def generate_rag_text(prompt, context, model="qwen2.5-coder:14b"):
+    rag_prompt = f"""
+Usa el siguiente contexto técnico para responder en castellano, de forma profesional y detallada:
+{chr(10).join(context)}
+
+{prompt}
+"""
+    response = chat(model=model, messages=[{"role": "user", "content": rag_prompt}])
+    return response["message"]["content"]
+
+def generate_architecture_diagram(context_texts, project_name, model="qwen2.5-coder:14b"):
+    prompt = f"""
+Analiza la siguiente información del proyecto {project_name} y genera un diagrama ASCII
+profesional que represente la arquitectura del sistema, incluyendo capas,
+módulos, dependencias y flujo de datos.
+"""
+    return generate_rag_text(prompt, context_texts, model=model)
+
+# -------------------------------
+# 🔍 Generación del README
+# -------------------------------
+def generate_readme_rag(project_data, output_path, template_filename="README_template.md"):
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    templates_dir = os.path.join(base_dir, "templates")
+    env = Environment(loader=FileSystemLoader(templates_dir))
+    template = env.get_template(template_filename)
+
+    # Contexto general
+    context_texts = []
+    for folder, files in project_data.get("folders_summary", {}).items():
         for f in files:
-            path = f.get("path")
-            narrative = f.get("narrative", "")
-            functions = f.get("functions", [])
-            exports = f.get("exports", [])
-            sql_count = len(f.get("sql_queries", []) or [])
+            context_texts.append(
+                f"{folder}/{f['file']}:\nExports: {' '.join(f.get('exports', []))}\n"
+                f"Functions: {' '.join(f.get('functions', []))}\n"
+                f"Classes: {' '.join(f.get('classes', []))}\n"
+                f"Comments: {' | '.join(f.get('comments', []))}\n"
+            )
 
-            entry = f"- **{os.path.basename(path)}** (`{path}`): {narrative}."
-            if functions:
-                entry += f" Funciones principales: {', '.join([fn['name'] for fn in functions[:6]])}."
-            if exports:
-                entry += f" Exports: {', '.join(exports[:6])}."
-            if sql_count:
-                entry += f" Contiene ~{sql_count} consultas SQL detectadas."
-            narratives.append(entry)
+    deps = project_data.get("dependencies", []) + project_data.get("devDependencies", [])
+    if deps:
+        context_texts.append("Dependencias: " + ", ".join(deps))
 
-        folder_text += "\n".join(narratives)
-        folder_sections.append(folder_text)
+    # Diagrama arquitectura
+    architecture_ascii = generate_architecture_diagram(context_texts, project_data.get("name", "Proyecto"))
 
-    folder_sections_text = "\n\n".join(folder_sections) or "No se detectaron carpetas con ficheros JS/TS."
+    # Rutas detalladas
+    detailed_routes = []
+    for route in project_data.get("routes", []):
+        filename = route.get("file")
+        if not filename or not os.path.exists(filename):
+            continue
+        with open(filename, "r", encoding="utf-8") as f:
+            code = f.read()
+        extracted_routes = extract_routes_from_code(code, filename)
+        for r in extracted_routes:
+            rag_context = [
+                f"Ruta: {r['method']} {r['path']}",
+                f"Handlers: {', '.join(r['handlers'])}",
+                f"Comentario: {r['comment']}"
+            ]
+            description = generate_rag_text(
+                f"Explica detalladamente la finalidad, flujo de datos y validaciones de la ruta {r['method']} {r['path']}.",
+                rag_context
+            )
+            r["description"] = description
+            detailed_routes.append(r)
 
-    # --- Rutas detectadas ---
-    routes_summary = []
-    for folder_files in folders.values():
-        for f in folder_files:
-            if os.path.basename(f.get("path", "")) == "router.js":
-                for r in f.get("routes", []):
-                    routes_summary.append(
-                        f"- `{r['method']} {r['path']}` → Handler: `{r['handler']}`. "
-                        f"Propósito inferido: {r.get('purpose', 'No inferido')}"
-                    )
+    # Kubernetes explicado
+    explained_k8s = {}
+    k8s_files = project_data.get("k8s", {})
+    for filename, content in (k8s_files or {}).items():
+        explained_k8s[filename] = content  # opcional: podrías generar explicación con RAG
 
-    routes_text = "\n".join(routes_summary) or "No se detectaron rutas."
+    # Análisis SQL
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    db_analysis = analyze_db_queries(project_root)
 
-    # --- Archivos clave ---
-    key_files = project_data.get("key_files", [])
+    # Renderizado final
+    print("🧠 Generando texto del README usando el modelo de Ollama...")
+    readme_md = template.render(
+        name=project_data.get("name", "Proyecto"),
+        description=project_data.get("description", ""),
+        elaborated_intro=generate_rag_text(
+            f"Genera un README técnico exhaustivo del proyecto {project_data['name']}, "
+            f"detallando arquitectura, módulos, rutas, dependencias y propósito general.",
+            context_texts
+        ),
+        architecture_ascii=architecture_ascii,
+        folders=project_data.get("folders_summary", {}),
+        dependencies=project_data.get("dependencies", []),
+        dev_dependencies=project_data.get("devDependencies", []),
+        routes=detailed_routes,
+        docker_section=project_data.get("docker", ""),
+        k8s_section=project_data.get("k8s", {}),
+        k8s_resources_explained=explained_k8s,
+        db_analysis=db_analysis,
+    )
 
-    # --- Información de Kubernetes ---
-    k8s = project_data.get("k8s", {})
-    k8s_section = ""
-    if k8s:
-        resources = k8s.get("resources", {})
-        dev_hosts = ", ".join(k8s.get("hosts", {}).get("dev", []))
-        pro_hosts = ", ".join(k8s.get("hosts", {}).get("pro", []))
-
-        def explain_resource(value, type_):
-            if type_ == "cpu":
-                if str(value).endswith("m"):
-                    cpu_val = int(value[:-1]) / 1000
-                    return f"{cpu_val} cores" if cpu_val >= 1 else f"{cpu_val*1000:.0f} milicores"
-                else:
-                    return f"{value} cores"
-            elif type_ == "mem":
-                if str(value).endswith("Mi"):
-                    mem_val = int(value[:-2])
-                    mem_mb = round(mem_val * 1.048576)
-                    if mem_mb >= 1024:
-                        mem_gb = round(mem_mb / 1024, 1)
-                        return f"{mem_gb} Gigabytes"
-                    else:
-                        return f"{mem_mb} Megabytes"
-                else:
-                    return f"{value} bytes"
-            return value
-
-        if resources:
-            requests = resources.get("requests", {})
-            limits = resources.get("limits", {})
-
-            k8s_human = f"""
-Kubernetes utiliza configuraciones de **requests** y **limits** para gestionar los recursos del contenedor:
-
-- **Requests**: Recursos mínimos garantizados que se reservan para el contenedor.
-  - CPU: {explain_resource(requests.get('cpu','0'), 'cpu')} → asegura que el contenedor siempre tenga CPU suficiente.
-  - Memoria: {explain_resource(requests.get('memory','0'), 'mem')} → asegura memoria suficiente.
-
-- **Limits**: Recursos máximos que el contenedor puede consumir.
-  - CPU: {explain_resource(limits.get('cpu','0'), 'cpu')} → evita que el contenedor consuma toda la CPU del nodo.
-  - Memoria: {explain_resource(limits.get('memory','0'), 'mem')} → protege la memoria de otros contenedores.
-
-> **Motivo:** Balancear eficiencia y seguridad, garantizando recursos suficientes sin afectar al clúster.
-"""
-            k8s_section = f"""
-## Despliegue Kubernetes
-
-{k8s_human}
-
-**Hosts detectados:**
-- DEV: [{dev_hosts}](http://{dev_hosts})  
-- PRO: [{pro_hosts}](http://{pro_hosts})
-"""
-
-    # --- Generar Resumen y Arquitectura elaborados con Mistral ---
-    elaborated_intro = generate_elaborated_intro(project_data)
-
-    # --- Construcción del prompt final para README ---
-    prompt = textwrap.dedent(f"""
-    Eres un asistente técnico. Con la información estricta que te doy, redacta un README.md completo en Markdown.
-    NO INVENTES nada que no esté en la información.
-    Usa un lenguaje claro y profesional.
-
-    Proyecto: {name}
-    Secciones iniciales generadas por Mistral (Resumen y Arquitectura):
-    {elaborated_intro}
-
-    Dependencias: {deps}
-    DevDependencies: {devdeps}
-    Scripts: {json.dumps(scripts, indent=2)}
-
-    Estructura (parcial):
-    {structure}
-
-    Resumen por carpetas y ficheros:
-    {folder_sections_text}
-
-    Rutas detectadas:
-    {routes_text}
-
-    Información Kubernetes:
-    {k8s_section}
-
-    Archivos clave: {', '.join(key_files) or 'Ninguno'}
-
-    Redacta el README completo incluyendo:
-    - Resumen del proyecto
-    - Arquitectura y flujo de datos
-    - Carpeta por carpeta
-    - Rutas y explicación
-    - Instalación
-    - Ejecución
-    - Testing
-    - Despliegue Kubernetes
-    - Licencia
-    """)
-
-    # --- Llamada final al modelo para README completo ---
-    response = chat(model="qwen2.5-coder:latest", messages=[
-        {"role": "user", "content": prompt}
-    ])
-    content = response['message']['content']
+    print(f"✏️ Generando README en: {output_path}")
+    print(f"Longitud del texto generado: {len(readme_md)} caracteres")
 
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write(readme_md)
 
-    print(f"✅ README generado en {output_path}")
+    print(f"✅ README generado correctamente en {output_path}")
